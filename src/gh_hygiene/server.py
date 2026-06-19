@@ -1,0 +1,1006 @@
+"""FastAPI web server for gh-hygiene chat UI.
+
+Provides a WebSocket endpoint that wraps the ChatSession,
+plus a lightweight REST API for status/health checks.
+
+Start with: gh-hygiene serve
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+from pathlib import Path
+from typing import Optional
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+import uvicorn
+
+from .auth import get_github_token, get_deepseek_api_key, get_token_source
+from .client import GitHubClient
+from .chat import ChatSession
+from .tools import register_tool
+from .commands.repos import list_repos, audit_repos, archive_repos
+from .commands.files import audit_files, clean_files, reorganize_files
+from .commands.hygiene import (
+    list_stale_issues,
+    close_stale_issues,
+    clean_pr_branches,
+    audit_labels,
+)
+from .display import print_info, print_error, print_success
+
+# ---------------------------------------------------------------------------
+# App setup
+# ---------------------------------------------------------------------------
+
+app = FastAPI(title="gh-hygiene", version="0.1.0")
+
+# Path to the single-page frontend
+UI_DIR = Path(__file__).parent / "ui"
+UI_DIR.mkdir(exist_ok=True)
+
+
+@app.get("/")
+async def root():
+    """Serve the chat UI."""
+    index_path = UI_DIR / "index.html"
+    if index_path.exists():
+        return HTMLResponse(index_path.read_text())
+    return HTMLResponse("<h1>UI not found. Run gh-hygiene serve to generate it.</h1>")
+
+
+@app.get("/api/health")
+async def health():
+    """Health check endpoint."""
+    gh_configured = get_github_token() is not None
+    ds_configured = get_deepseek_api_key() is not None
+    return {
+        "status": "ok",
+        "github_configured": gh_configured,
+        "deepseek_configured": ds_configured,
+        "github_source": get_token_source() if gh_configured else "none",
+    }
+
+
+# ---------------------------------------------------------------------------
+# WebSocket chat
+# ---------------------------------------------------------------------------
+
+
+class WebSocketChatSession:
+    """Wraps ChatSession for WebSocket communication.
+
+    Instead of reading from stdin and writing to stdout,
+    this class yields events through a WebSocket.
+    Supports intent fast-paths for common queries.
+    """
+
+    def __init__(self, ws: WebSocket, session: ChatSession, client: Any = None):
+        self.ws = ws
+        self.session = session
+        self.client = client
+        self._confirm_future: Optional[asyncio.Future] = None
+
+    async def run(self):
+        """Main loop: listen for client messages, process through LLM."""
+        try:
+            while True:
+                data = await self.ws.receive_text()
+                msg = json.loads(data)
+                msg_type = msg.get("type", "message")
+
+                if msg_type == "message":
+                    await self._handle_message(msg.get("content", ""))
+
+                elif msg_type == "confirm":
+                    await self._handle_confirm()
+
+                elif msg_type == "reject":
+                    await self._handle_reject()
+
+                elif msg_type == "ping":
+                    await self.ws.send_text(json.dumps({"type": "pong"}))
+
+        except WebSocketDisconnect:
+            pass
+
+    async def _handle_message(self, content: str):
+        """Send user message, checking for intent fast-paths first."""
+        # Try intent fast-path for common queries
+        if self.client:
+            from .intents import detect_intent
+            intent = detect_intent(content)
+
+            if intent == "list_repos":
+                await self._fast_list_repos(content)
+                return
+
+            if intent == "audit_repos":
+                # Fall through to LLM for audit (needs LLM analysis)
+                pass
+
+        # Default: use LLM
+        self.session._messages.append({"role": "user", "content": content})
+        await self._run_llm_loop()
+
+    async def _fast_list_repos(self, user_message: str):
+        """Fast-path: return cached repo list directly, then LLM follow-up."""
+        try:
+            # Get cached repos (pre-fetched on connect)
+            repos = await asyncio.to_thread(self.client.get_repo_dicts_cached)
+
+            # Send tool_result directly to UI
+            repo_list = []
+            for r in repos:
+                repo_list.append({
+                    "name": r["name"],
+                    "description": r.get("description", ""),
+                    "visibility": r["visibility"],
+                    "language": r.get("language", ""),
+                    "last_push": r["last_push"],
+                    "archived": r["archived"],
+                    "stars": r.get("stars", 0),
+                })
+
+            await self._send({
+                "type": "tool_result",
+                "tool": "list_repos",
+                "total": len(repo_list),
+                "content": repo_list,
+                "message": f"Found {len(repo_list)} repositories across your account.",
+            })
+
+            # Fast LLM follow-up: just a natural language confirmation
+            self.session._messages.append({"role": "user", "content": user_message})
+            self.session._messages.append({
+                "role": "system",
+                "content": f"You just showed the user a list of their {len(repo_list)} GitHub repos as cards. Say ONE brief sentence acknowledging this (e.g., mention a notable stat like how many are public/private or the most common language). Do NOT list repos again.",
+            })
+            await self._run_llm_loop(max_iterations=2)
+
+        except Exception as e:
+            await self._send({"type": "error", "content": f"Failed to fetch repos: {e}"})
+
+    async def _run_llm_loop(self, max_iterations: int = 10):
+        """Core LLM loop adapted for WebSocket."""
+        for _ in range(max_iterations):
+            response = await asyncio.to_thread(self.session._call_llm)
+
+            if response is None:
+                await self._send({"type": "error", "content": "Failed to get response from DeepSeek. Check your API key."})
+                return
+
+            message = response.choices[0].message
+
+            # Text reply — send to client and return
+            if message.content and not message.tool_calls:
+                self.session._messages.append({"role": "assistant", "content": message.content})
+                await self._send({"type": "text", "content": message.content})
+                return
+
+            # Tool calls
+            if message.tool_calls:
+                # Send tool call info to client
+                tool_info = []
+                for tc in message.tool_calls:
+                    try:
+                        args = json.loads(tc.function.arguments)
+                    except json.JSONDecodeError:
+                        args = {}
+                    tool_info.append({
+                        "id": tc.id,
+                        "name": tc.function.name,
+                        "args": args,
+                    })
+
+                await self._send({
+                    "type": "tool_calls",
+                    "content": message.content or "",
+                    "tools": tool_info,
+                })
+
+                # Add assistant message to history
+                self.session._messages.append({
+                    "role": "assistant",
+                    "content": message.content or "",
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments,
+                            },
+                        }
+                        for tc in message.tool_calls
+                    ],
+                })
+
+                # Process each tool call
+                all_read_only = True
+                for tc in message.tool_calls:
+                    result = self.session._handle_tool_call(
+                        tc.id, tc.function.name, tc.function.arguments
+                    )
+
+                    # Check if this is a destructive tool waiting for confirmation
+                    if self.session._pending_destructive:
+                        all_read_only = False
+                        tools = [info["tool_name"] for info in self.session._pending_destructive.values()]
+                        await self._send({
+                            "type": "confirm_request",
+                            "content": f"Ready to execute: {', '.join(tools)}",
+                            "tools": tools,
+                        })
+                        return  # Pause and wait for confirmation
+
+                    # Feed result back
+                    self.session._messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": json.dumps(result, default=str),
+                    })
+
+                # If all tools were read-only, continue the loop
+                if all_read_only:
+                    await self._send({
+                        "type": "status",
+                        "content": "Tools executed, continuing...",
+                    })
+                    continue
+                else:
+                    return
+
+            return
+
+        await self._send({"type": "error", "content": "Reached maximum steps. Please continue."})
+
+    async def _handle_confirm(self):
+        """User confirmed pending destructive actions."""
+        if not self.session._pending_destructive:
+            await self._send({"type": "error", "content": "No pending actions to confirm."})
+            return
+
+        # Execute all pending actions
+        results = []
+        for tc_id, info in self.session._pending_destructive.items():
+            tool_name = info["tool_name"]
+            args = dict(info["args"])
+            args["dry_run"] = False
+
+            fn = register_tool.__wrapped__ if hasattr(register_tool, '__wrapped__') else None
+            from .tools import get_tool_function
+            fn = get_tool_function(tool_name)
+            if fn:
+                try:
+                    result = await asyncio.to_thread(fn, **args)
+                    results.append({"tool_name": tool_name, "result": "success"})
+                    await self._send({
+                        "type": "status",
+                        "content": f"✅ {tool_name} completed successfully.",
+                    })
+                except Exception as e:
+                    results.append({"tool_name": tool_name, "result": "error", "error": str(e)})
+                    await self._send({
+                        "type": "error",
+                        "content": f"Failed to execute {tool_name}: {e}",
+                    })
+            else:
+                results.append({"tool_name": tool_name, "result": "error", "error": "function not found"})
+
+        # Feed results back
+        for tc_id, result in zip(self.session._pending_destructive.keys(), results):
+            self.session._messages.append({
+                "role": "tool",
+                "tool_call_id": tc_id,
+                "content": json.dumps(result, default=str),
+            })
+
+        self.session._pending_destructive.clear()
+
+        # Continue the LLM loop
+        await self._run_llm_loop()
+
+    async def _handle_reject(self):
+        """User rejected pending destructive actions."""
+        if not self.session._pending_destructive:
+            await self._send({"type": "error", "content": "No pending actions to reject."})
+            return
+
+        for tc_id, info in self.session._pending_destructive.items():
+            self.session._messages.append({
+                "role": "tool",
+                "tool_call_id": tc_id,
+                "content": json.dumps({
+                    "status": "rejected",
+                    "message": f"User declined to execute {info['tool_name']}.",
+                }),
+            })
+
+        self.session._pending_destructive.clear()
+        await self._send({"type": "status", "content": "❌ Action cancelled."})
+
+        # Continue the LLM loop
+        await self._run_llm_loop()
+
+    async def _send(self, data: dict):
+        """Send JSON data through the WebSocket."""
+        await self.ws.send_text(json.dumps(data, default=str))
+
+
+@app.websocket("/ws/chat")
+async def websocket_chat(ws: WebSocket):
+    """WebSocket endpoint for chat with caching and intent fast-paths."""
+    await ws.accept()
+
+    # Check auth
+    gh_token = get_github_token()
+    ds_key = get_deepseek_api_key()
+
+    if not gh_token or not ds_key:
+        await ws.send_text(json.dumps({
+            "type": "error",
+            "content": "Authentication not configured. Run 'gh-hygiene auth setup' first.",
+        }))
+        await ws.close()
+        return
+
+    # Set up session
+    client = GitHubClient(gh_token)
+    _register_tools_for_ui(client)
+
+    # Pre-fetch repos in background on connect
+    asyncio.create_task(_prefetch_repos(client))
+
+    session = ChatSession(ds_key, client)
+    ws_session = WebSocketChatSession(ws, session, client)
+
+    # Send connected info with account name
+    gh_user = client.user.login if client.user else "unknown"
+    await ws.send_text(json.dumps({
+        "type": "connected",
+        "github_user": gh_user,
+        "content": f"👋 Hello! I'm connected to your GitHub account as **{gh_user}**. I can help you manage your repos — just tell me what you need.",
+    }))
+
+    await ws_session.run()
+
+
+async def _prefetch_repos(client: GitHubClient):
+    """Pre-fetch repos in background to warm the cache."""
+    try:
+        await asyncio.to_thread(client.get_all_repos_cached)
+    except Exception:
+        pass
+
+
+def _register_tools_for_ui(client: GitHubClient):
+    """Register tool function implementations for the web UI."""
+    register_tool("list_repos", lambda **kw: list_repos(client, **kw))
+    register_tool("audit_repos", lambda **kw: audit_repos(client, **kw))
+    register_tool("archive_repos", lambda **kw: archive_repos(client, **kw))
+    register_tool("audit_files", lambda **kw: audit_files(client, **kw))
+    register_tool("clean_files", lambda **kw: clean_files(client, **kw))
+    register_tool("reorganize_files", lambda **kw: reorganize_files(client, **kw))
+    register_tool("list_stale_issues", lambda **kw: list_stale_issues(client, **kw))
+    register_tool("close_stale_issues", lambda **kw: close_stale_issues(client, **kw))
+    register_tool("clean_pr_branches", lambda **kw: clean_pr_branches(client, **kw))
+    register_tool("audit_labels", lambda **kw: audit_labels(client, **kw))
+    register_tool("get_rate_limit", lambda **kw: client.get_rate_limit())
+
+
+# ---------------------------------------------------------------------------
+# Server launcher
+# ---------------------------------------------------------------------------
+
+
+def start_server(host: str = "127.0.0.1", port: int = 8080):
+    """Start the uvicorn server."""
+    # Ensure the UI file exists (generate it from the package if needed)
+    ui_path = UI_DIR / "index.html"
+    if not ui_path.exists():
+        _generate_ui(ui_path)
+
+    print_success(f"🚀 gh-hygiene UI starting at http://{host}:{port}")
+    print_info("Press Ctrl+C to stop.")
+
+    uvicorn.run(
+        "gh_hygiene.server:app",
+        host=host,
+        port=port,
+        log_level="warning",
+    )
+
+
+def _generate_ui(path: Path):
+    """Generate the default UI HTML file."""
+    html = _get_ui_html()
+    path.write_text(html)
+
+
+def _get_ui_html() -> str:
+    """Return the complete UI HTML."""
+    return r'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>gh-hygiene — Repo Manager</title>
+<style>
+  :root {
+    --bg: #0d0d0d;
+    --surface: #161616;
+    --surface2: #1e1e1e;
+    --border: #2a2a2a;
+    --text: #d4d4d4;
+    --text-dim: #6b6b6b;
+    --accent: #d4a853;
+    --accent-glow: rgba(212,168,83,0.15);
+    --green: #4ec9b0;
+    --red: #f44747;
+    --blue: #569cd6;
+    --radius: 8px;
+    --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    --mono: "SF Mono", "JetBrains Mono", "Fira Code", monospace;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    font-family: var(--font);
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* Header */
+  header {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 12px 20px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-shrink: 0;
+  }
+  header .logo {
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--accent);
+    letter-spacing: -0.3px;
+  }
+  header .logo span { color: var(--text-dim); font-weight: 400; }
+  header .status {
+    margin-left: auto;
+    font-size: 12px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--text-dim);
+  }
+  .status-dot {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: var(--green);
+    box-shadow: 0 0 6px rgba(78,201,176,0.4);
+  }
+  .status-dot.off { background: var(--red); box-shadow: 0 0 6px rgba(244,71,71,0.4); }
+
+  /* Chat area */
+  .chat-container {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  .chat-container::-webkit-scrollbar { width: 6px; }
+  .chat-container::-webkit-scrollbar-track { background: transparent; }
+  .chat-container::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+  /* Messages */
+  .msg {
+    display: flex;
+    flex-direction: column;
+    max-width: 85%;
+    animation: fadeIn 0.25s ease;
+  }
+  @keyframes fadeIn { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:translateY(0); } }
+  .msg.user { align-self: flex-end; }
+  .msg.assistant { align-self: flex-start; }
+  .msg.system { align-self: center; max-width: 100%; }
+
+  .msg-bubble {
+    padding: 12px 16px;
+    border-radius: var(--radius);
+    line-height: 1.55;
+    font-size: 14px;
+    word-wrap: break-word;
+  }
+  .msg.user .msg-bubble {
+    background: var(--accent);
+    color: #1a1a1a;
+    border-bottom-right-radius: 2px;
+  }
+  .msg.assistant .msg-bubble {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-bottom-left-radius: 2px;
+  }
+  .msg.system .msg-bubble {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    font-size: 13px;
+    color: var(--text-dim);
+    text-align: center;
+    padding: 8px 16px;
+  }
+  .msg.system.error .msg-bubble {
+    border-color: rgba(244,71,71,0.3);
+    color: var(--red);
+  }
+  .msg-bubble p { margin-bottom: 8px; }
+  .msg-bubble p:last-child { margin-bottom: 0; }
+  .msg-bubble code {
+    font-family: var(--mono);
+    font-size: 13px;
+    background: rgba(255,255,255,0.06);
+    padding: 2px 6px;
+    border-radius: 3px;
+  }
+  .msg-bubble pre {
+    background: rgba(0,0,0,0.3);
+    border-radius: 6px;
+    padding: 12px;
+    overflow-x: auto;
+    margin: 8px 0;
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.5;
+  }
+
+  /* Tool call display */
+  .tool-call {
+    margin-top: 6px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+    font-size: 13px;
+  }
+  .tool-call-header {
+    background: var(--surface);
+    padding: 8px 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .tool-call-header:hover { background: var(--surface2); }
+  .tool-call-icon { font-size: 14px; }
+  .tool-call-name { font-family: var(--mono); color: var(--blue); font-size: 12px; }
+  .tool-call-chevron { margin-left: auto; color: var(--text-dim); transition: transform 0.2s; }
+  .tool-call.open .tool-call-chevron { transform: rotate(180deg); }
+  .tool-call-body {
+    display: none;
+    padding: 10px 12px;
+    background: rgba(0,0,0,0.2);
+    font-family: var(--mono);
+    font-size: 12px;
+    white-space: pre-wrap;
+    color: var(--text-dim);
+    max-height: 200px;
+    overflow-y: auto;
+  }
+  .tool-call.open .tool-call-body { display: block; }
+
+  /* Confirmation bar */
+  .confirm-bar {
+    align-self: center;
+    background: var(--surface);
+    border: 1px solid var(--accent);
+    border-radius: var(--radius);
+    padding: 14px 20px;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    animation: fadeIn 0.25s ease;
+  }
+  .confirm-bar .text { font-size: 14px; color: var(--accent); flex: 1; }
+  .confirm-bar button {
+    padding: 8px 18px;
+    border-radius: 5px;
+    border: none;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .btn-confirm {
+    background: var(--accent);
+    color: #1a1a1a;
+  }
+  .btn-confirm:hover { filter: brightness(1.1); }
+  .btn-reject {
+    background: transparent;
+    color: var(--text-dim);
+    border: 1px solid var(--border) !important;
+  }
+  .btn-reject:hover { color: var(--text); border-color: var(--text-dim) !important; }
+
+  /* Input area */
+  .input-container {
+    background: var(--surface);
+    border-top: 1px solid var(--border);
+    padding: 14px 20px;
+    display: flex;
+    gap: 10px;
+    flex-shrink: 0;
+  }
+  .input-container input {
+    flex: 1;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 12px 16px;
+    color: var(--text);
+    font-size: 14px;
+    font-family: var(--font);
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .input-container input:focus { border-color: var(--accent); }
+  .input-container input::placeholder { color: var(--text-dim); }
+  .input-container button {
+    background: var(--accent);
+    color: #1a1a1a;
+    border: none;
+    border-radius: var(--radius);
+    padding: 0 20px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .input-container button:hover { filter: brightness(1.1); }
+  .input-container button:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  /* Loading dots */
+  .typing-dots {
+    display: flex;
+    gap: 4px;
+    padding: 4px 0;
+  }
+  .typing-dots span {
+    width: 6px; height: 6px;
+    background: var(--text-dim);
+    border-radius: 50%;
+    animation: bounce 1.2s infinite;
+  }
+  .typing-dots span:nth-child(2) { animation-delay: 0.2s; }
+  .typing-dots span:nth-child(3) { animation-delay: 0.4s; }
+  @keyframes bounce { 0%,60%,100% { transform:translateY(0); } 30% { transform:translateY(-6px); } }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">gh-hygiene <span>/ repo manager</span></div>
+  <div class="status">
+    <span id="github-user" style="color:var(--accent);font-weight:600;font-size:12px;margin-right:12px;"></span>
+    <div class="status-dot" id="status-dot"></div>
+    <span id="status-text">connecting...</span>
+  </div>
+</header>
+
+<div class="chat-container" id="chat"></div>
+
+<div class="input-container">
+  <input id="msg-input" type="text" placeholder="Tell me what to do with your repos..." disabled />
+  <button id="send-btn" disabled>Send</button>
+</div>
+
+<script>
+const chat = document.getElementById('chat');
+const input = document.getElementById('msg-input');
+const sendBtn = document.getElementById('send-btn');
+const statusDot = document.getElementById('status-dot');
+const statusText = document.getElementById('status-text');
+
+let ws = null;
+let pendingConfirm = false;
+
+function connect() {
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(protocol + '//' + location.host + '/ws/chat');
+
+  ws.onopen = () => {
+    setStatus(true, 'connected');
+    input.disabled = false;
+    sendBtn.disabled = false;
+    input.focus();
+  };
+
+  ws.onclose = () => {
+    setStatus(false, 'disconnected');
+    input.disabled = true;
+    sendBtn.disabled = true;
+    setTimeout(connect, 3000);
+  };
+
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    handleMessage(msg);
+  };
+
+  ws.onerror = () => {
+    setStatus(false, 'error');
+  };
+}
+
+function setStatus(ok, text) {
+  statusDot.className = 'status-dot' + (ok ? '' : ' off');
+  statusText.textContent = text;
+}
+
+function handleMessage(msg) {
+  removeTyping();
+
+  switch (msg.type) {
+    case 'connected':
+      setStatus(true, 'connected');
+      if (msg.github_user) {
+        document.getElementById('github-user').textContent = '@' + msg.github_user;
+      }
+      addMessage('assistant', msg.content);
+      break;
+    case 'text':
+      addMessage('assistant', msg.content);
+      break;
+    case 'text_chunk':
+      appendStreamingText(msg.content);
+      break;
+    case 'text_end':
+      finalizeStreamingText();
+      break;
+    case 'tool_calls':
+      addToolCalls(msg.content, msg.tools);
+      break;
+    case 'confirm_request':
+      addConfirmBar(msg.content, msg.tools);
+      pendingConfirm = true;
+      break;
+    case 'status':
+      addMessage('system', msg.content);
+      break;
+    case 'error':
+      addMessage('system', msg.content, true);
+      break;
+    case 'tool_result':
+      addToolResult(msg);
+      break;
+    case 'pong':
+      break;
+  }
+  scrollDown();
+}
+
+function addMessage(role, content, isError = false) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + role + (isError ? ' error' : '');
+  
+  const bubble = document.createElement('div');
+  bubble.className = 'msg-bubble';
+  bubble.innerHTML = renderMarkdown(content);
+  div.appendChild(bubble);
+  
+  chat.appendChild(div);
+}
+
+function addToolResult(msg) {
+  removeTyping();
+  const div = document.createElement('div');
+  div.className = 'msg assistant';
+  div.style.maxWidth = '95%';
+  
+  // Header
+  const header = document.createElement('div');
+  header.style.cssText = 'font-size:13px;color:var(--text-dim);margin-bottom:8px;';
+  header.textContent = msg.message || (msg.tool + ' results');
+  div.appendChild(header);
+  
+  // Repo list grid
+  const grid = document.createElement('div');
+  grid.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;';
+  
+  const repos = Array.isArray(msg.content) ? msg.content : [];
+  const show = repos.slice(0, 50); // Show first 50 in grid
+  const remaining = repos.length - show.length;
+  
+  show.forEach(r => {
+    const card = document.createElement('div');
+    card.style.cssText = 'background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:8px 10px;font-size:13px;min-width:200px;flex:1;max-width:320px;';
+    card.innerHTML = `
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px;">
+        <strong style="color:var(--accent);font-size:13px;">${esc(r.name)}</strong>
+        <span style="font-size:10px;color:var(--text-dim);">${r.visibility === 'private' ? '🔒' : '🌐'}</span>
+      </div>
+      <div style="color:var(--text-dim);font-size:11px;line-height:1.4;">${esc(r.description || '')}</div>
+      <div style="display:flex;gap:8px;margin-top:4px;font-size:10px;color:var(--text-dim);">
+        ${r.language ? '<span style="color:var(--blue);">' + esc(r.language) + '</span>' : ''}
+        <span>⭐ ' + (r.stars || 0) + '</span>
+        <span>' + esc(r.last_push || '') + '</span>
+      </div>
+    `;
+    grid.appendChild(card);
+  });
+  div.appendChild(grid);
+  
+  if (remaining > 0) {
+    const more = document.createElement('div');
+    more.style.cssText = 'text-align:center;padding:8px;color:var(--text-dim);font-size:12px;margin-top:4px;';
+    more.textContent = '... and ' + remaining + ' more repos';
+    div.appendChild(more);
+  }
+  
+  // Total count
+  const total = document.createElement('div');
+  total.style.cssText = 'text-align:right;font-size:11px;color:var(--text-dim);margin-top:8px;border-top:1px solid var(--border);padding-top:6px;';
+  total.textContent = 'Total: ' + repos.length + ' repositories';
+  div.appendChild(total);
+  
+  chat.appendChild(div);
+}
+
+function addToolCalls(text, tools) {
+  const div = document.createElement('div');
+  div.className = 'msg assistant';
+
+  if (text) {
+    const bubble = document.createElement('div');
+    bubble.className = 'msg-bubble';
+    bubble.innerHTML = renderMarkdown(text);
+    div.appendChild(bubble);
+  }
+
+  tools.forEach(t => {
+    const tc = document.createElement('div');
+    tc.className = 'tool-call';
+    tc.innerHTML = `
+      <div class="tool-call-header" onclick="this.parentElement.classList.toggle('open')">
+        <span class="tool-call-icon">🔧</span>
+        <span class="tool-call-name">${esc(t.name)}</span>
+        <span class="tool-call-chevron">▾</span>
+      </div>
+      <div class="tool-call-body">${esc(JSON.stringify(t.args, null, 2))}</div>
+    `;
+    div.appendChild(tc);
+  });
+
+  chat.appendChild(div);
+}
+
+function addConfirmBar(text, tools) {
+  const div = document.createElement('div');
+  div.className = 'confirm-bar';
+  div.id = 'confirm-bar';
+  div.innerHTML = `
+    <span class="text">⚠️ ${esc(text)}</span>
+    <button class="btn-confirm" onclick="confirmAction()">✓ Confirm</button>
+    <button class="btn-reject" onclick="rejectAction()">✗ Cancel</button>
+  `;
+  chat.appendChild(div);
+}
+
+function addTyping() {
+  removeTyping();
+  const div = document.createElement('div');
+  div.className = 'msg assistant';
+  div.id = 'typing-indicator';
+  div.innerHTML = '<div class="msg-bubble"><div class="typing-dots"><span></span><span></span><span></span></div></div>';
+  chat.appendChild(div);
+  scrollDown();
+}
+
+function removeTyping() {
+  const el = document.getElementById('typing-indicator');
+  if (el) el.remove();
+}
+
+function renderMarkdown(text) {
+  if (!text) return '';
+  return text
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*(.+?)\*/g, '<em>$1</em>')
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/```([\s\S]*?)```/g, '<pre>$1</pre>')
+    .replace(/^### (.+)/gm, '<strong>$1</strong>')
+    .replace(/^## (.+)/gm, '<strong>$1</strong>')
+    .replace(/^# (.+)/gm, '<strong>$1</strong>')
+    .replace(/^- (.+)/gm, '• $1')
+    .replace(/\n/g, '<br>');
+}
+
+function esc(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+let streamingEl = null;
+
+function appendStreamingText(content) {
+  if (!streamingEl) {
+    removeTyping();
+    streamingEl = document.createElement('div');
+    streamingEl.className = 'msg assistant';
+    const bubble = document.createElement('div');
+    bubble.className = 'msg-bubble';
+    bubble.id = 'streaming-bubble';
+    streamingEl.appendChild(bubble);
+    chat.appendChild(streamingEl);
+  }
+  const bubble = document.getElementById('streaming-bubble');
+  if (bubble) {
+    bubble.innerHTML += renderMarkdown(content.replace(/\n/g, '<br>'));
+  }
+  scrollDown();
+}
+
+function finalizeStreamingText() {
+  streamingEl = null;
+}
+
+function scrollDown() {
+  chat.scrollTop = chat.scrollHeight;
+}
+
+function sendMessage() {
+  const text = input.value.trim();
+  if (!text || !ws || ws.readyState !== WebSocket.OPEN || pendingConfirm) return;
+
+  addMessage('user', text);
+  input.value = '';
+  addTyping();
+
+  ws.send(JSON.stringify({ type: 'message', content: text }));
+}
+
+function confirmAction() {
+  if (!ws || !pendingConfirm) return;
+  removeConfirmBar();
+  pendingConfirm = false;
+  addTyping();
+  ws.send(JSON.stringify({ type: 'confirm' }));
+}
+
+function rejectAction() {
+  if (!ws || !pendingConfirm) return;
+  removeConfirmBar();
+  pendingConfirm = false;
+  addTyping();
+  ws.send(JSON.stringify({ type: 'reject' }));
+}
+
+function removeConfirmBar() {
+  const el = document.getElementById('confirm-bar');
+  if (el) el.remove();
+}
+
+input.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); sendMessage(); }
+});
+sendBtn.addEventListener('click', sendMessage);
+
+connect();
+</script>
+</body>
+</html>'''
