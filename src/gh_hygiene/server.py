@@ -244,6 +244,7 @@ class WebSocketChatSession:
                 return
 
             message = response.choices[0].message
+            finish_reason = response.choices[0].finish_reason
 
             # Text reply — send to client and return
             if message.content and not message.tool_calls:
@@ -332,6 +333,26 @@ class WebSocketChatSession:
                     continue
                 else:
                     return
+
+            # Neither text nor tool calls — LLM stopped silently
+            if finish_reason == "length":
+                self.session._messages.append({
+                    "role": "system",
+                    "content": "Your previous response was cut off (max tokens reached). Continue from where you left off."
+                })
+                await self._send({"type": "thinking", "content": "Response truncated, continuing..."})
+                continue
+            elif finish_reason == "stop":
+                # LLM thinks it's done but returned no content — ask it to produce something
+                self.session._messages.append({
+                    "role": "system",
+                    "content": "You stopped without producing any output. If you're done with the task, summarize what happened. Otherwise, continue."
+                })
+                await self._send({"type": "thinking", "content": "LLM stopped — asking to continue..."})
+                continue
+            else:
+                await self._send({"type": "error", "content": f"LLM returned empty response (finish_reason={finish_reason}). Try asking again."})
+                return
 
             return
 

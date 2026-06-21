@@ -217,7 +217,7 @@ class ChatSession:
                 tools=TOOL_DEFINITIONS,
                 tool_choice="auto",
                 temperature=0.7,
-                max_tokens=4096,
+                max_tokens=8192,
             )
         except Exception as e:
             print_error(f"LLM API error: {e}")
@@ -232,7 +232,7 @@ class ChatSession:
                 tools=TOOL_DEFINITIONS,
                 tool_choice="auto",
                 temperature=0.7,
-                max_tokens=4096,
+                max_tokens=8192,
                 stream=True,
             )
         except Exception as e:
