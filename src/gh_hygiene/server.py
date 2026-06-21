@@ -890,7 +890,9 @@ let isProcessing = false;
 
 function connect() {
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(protocol + '//' + location.host + '/ws/chat');
+  const url = protocol + '//' + location.host + '/ws/chat';
+  statusText.textContent = 'connecting to ' + url + '...';
+  ws = new WebSocket(url);
 
   ws.onopen = () => {
     setStatus(true, 'connected');
@@ -899,20 +901,24 @@ function connect() {
     input.focus();
   };
 
-  ws.onclose = () => {
-    setStatus(false, 'disconnected');
+  ws.onclose = (e) => {
+    setStatus(false, 'disconnected (code ' + e.code + ')');
     input.disabled = true;
     sendBtn.disabled = true;
     setTimeout(connect, 3000);
   };
 
   ws.onmessage = (e) => {
-    const msg = JSON.parse(e.data);
-    handleMessage(msg);
+    try {
+      const msg = JSON.parse(e.data);
+      handleMessage(msg);
+    } catch (err) {
+      setStatus(false, 'parse error: ' + err.message);
+    }
   };
 
-  ws.onerror = () => {
-    setStatus(false, 'error');
+  ws.onerror = (e) => {
+    setStatus(false, 'ws error');
   };
 }
 
