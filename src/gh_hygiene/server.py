@@ -880,6 +880,29 @@ def _get_ui_html() -> str:
   <button id="send-btn" disabled>Send</button>
 </div>
 
+<!-- Settings Modal -->
+<div class="modal-overlay" id="modal-overlay">
+  <div class="modal">
+    <h2>Settings</h2>
+    <div class="account-info" id="settings-account">
+      <div class="dot" id="settings-dot"></div>
+      <div>
+        <div>Connected as <span class="value" id="settings-user">...</span></div>
+        <div class="source" id="settings-source">loading...</div>
+      </div>
+    </div>
+    <label>GitHub Personal Access Token</label>
+    <input type="password" id="settings-gh-token" placeholder="ghp_... (leave blank to keep current)" />
+    <label>DeepSeek API Key</label>
+    <input type="password" id="settings-ds-key" placeholder="sk-... (leave blank to keep current)" />
+    <div class="btn-row">
+      <button class="btn-cancel" onclick="closeSettings()">Cancel</button>
+      <button class="btn-save" onclick="saveSettings()">Save &amp; Reconnect</button>
+    </div>
+    <div class="saved-msg" id="saved-msg">Saved! Reconnecting...</div>
+  </div>
+</div>
+
 <script>
 // --- Debug banner ---
 const DEBUG = document.createElement('div');
@@ -1321,28 +1344,6 @@ connect();
   statusText.textContent = 'JS Error: ' + e.message;
 }
 </script>
-<!-- Settings Modal -->
-<div class="modal-overlay" id="modal-overlay">
-  <div class="modal">
-    <h2>Settings</h2>
-    <div class="account-info" id="settings-account">
-      <div class="dot" id="settings-dot"></div>
-      <div>
-        <div>Connected as <span class="value" id="settings-user">...</span></div>
-        <div class="source" id="settings-source">loading...</div>
-      </div>
-    </div>
-    <label>GitHub Personal Access Token</label>
-    <input type="password" id="settings-gh-token" placeholder="ghp_... (leave blank to keep current)" />
-    <label>DeepSeek API Key</label>
-    <input type="password" id="settings-ds-key" placeholder="sk-... (leave blank to keep current)" />
-    <div class="btn-row">
-      <button class="btn-cancel" onclick="closeSettings()">Cancel</button>
-      <button class="btn-save" onclick="saveSettings()">Save &amp; Reconnect</button>
-    </div>
-    <div class="saved-msg" id="saved-msg">Saved! Reconnecting...</div>
-  </div>
-</div>
 
 </body>
 </html>'''
