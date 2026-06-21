@@ -1346,6 +1346,7 @@ function removeConfirmBar() {
 // --- Settings Modal ---
 
 async function openSettings() {
+  debug('openSettings() called');
   const overlay = document.getElementById('modal-overlay');
   overlay.classList.add('open');
 
@@ -1373,8 +1374,10 @@ function closeSettings() {
 }
 
 async function saveSettings() {
+  debug('saveSettings() called');
   const ghToken = document.getElementById('settings-gh-token').value.trim();
   const dsKey = document.getElementById('settings-ds-key').value.trim();
+  debug('ghToken length=' + ghToken.length + ' dsKey length=' + dsKey.length);
 
   if (!ghToken && !dsKey) {
     document.getElementById('saved-msg').textContent = 'Enter a token or key to save.';
@@ -1392,12 +1395,14 @@ async function saveSettings() {
   saveBtn.disabled = true;
 
   try {
+    debug('POST /api/settings...');
     const resp = await fetch('/api/settings', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
     const data = await resp.json();
+    debug('Settings response: ' + JSON.stringify(data));
 
     if (data.status === 'ok') {
       document.getElementById('saved-msg').style.color = 'var(--green)';
@@ -1410,6 +1415,7 @@ async function saveSettings() {
       throw new Error(data.message || 'Unknown error');
     }
   } catch (e) {
+    debug('saveSettings ERROR: ' + e.message);
     document.getElementById('saved-msg').textContent = 'Error: ' + e.message;
     document.getElementById('saved-msg').style.color = 'var(--red)';
     document.getElementById('saved-msg').style.display = 'block';
