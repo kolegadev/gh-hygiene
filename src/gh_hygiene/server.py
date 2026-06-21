@@ -22,8 +22,8 @@ import uvicorn
 from .auth import get_github_token, get_deepseek_api_key, get_token_source, get_github_username, store_github_token, store_deepseek_key
 from .client import GitHubClient
 from .chat import ChatSession
-from .tools import register_tool
-from .commands.repos import list_repos, audit_repos, archive_repos
+from .tools import register_tool, run_shell_command
+from .commands.repos import list_repos, audit_repos, archive_repos, change_visibility
 from .commands.files import audit_files, clean_files, reorganize_files
 from .commands.hygiene import (
     list_stale_issues,
@@ -454,6 +454,7 @@ def _register_tools_for_ui(client: GitHubClient):
     register_tool("list_repos", lambda **kw: list_repos(client, **kw))
     register_tool("audit_repos", lambda **kw: audit_repos(client, **kw))
     register_tool("archive_repos", lambda **kw: archive_repos(client, **kw))
+    register_tool("change_visibility", lambda **kw: change_visibility(client, **kw))
     register_tool("audit_files", lambda **kw: audit_files(client, **kw))
     register_tool("clean_files", lambda **kw: clean_files(client, **kw))
     register_tool("reorganize_files", lambda **kw: reorganize_files(client, **kw))
@@ -462,6 +463,7 @@ def _register_tools_for_ui(client: GitHubClient):
     register_tool("clean_pr_branches", lambda **kw: clean_pr_branches(client, **kw))
     register_tool("audit_labels", lambda **kw: audit_labels(client, **kw))
     register_tool("get_rate_limit", lambda **kw: client.get_rate_limit())
+    register_tool("run_shell_command", lambda **kw: run_shell_command(**kw))
 
 
 # ---------------------------------------------------------------------------

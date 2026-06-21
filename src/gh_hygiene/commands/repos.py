@@ -279,3 +279,111 @@ def archive_repos(
 
     print_success(f"Archived {len(archived)} repos.")
     return result
+
+
+def change_visibility(
+    client: GitHubClient,
+    repos: list[str],
+    visibility: str = "private",
+    dry_run: bool = True,
+    json_output: bool = False,
+) -> dict[str, Any]:
+    """Change repo visibility (public/private) for a list of repos.
+
+    Uses PyGithub repo.edit(private=True/False).
+    Falls back to gh CLI when PyGithub fails.
+    """
+    import subprocess
+
+    if visibility not in ("private", "public"):
+        return {"error": f"Invalid visibility: {visibility}. Must be 'private' or 'public'."}
+
+    make_private = visibility == "private"
+
+    # Resolve repo objects
+    resolved = []
+    not_found = []
+    for name in repos:
+        repo = client.get_repo(name)
+        if repo:
+            resolved.append(repo)
+        else:
+            not_found.append(name)
+
+    if not resolved:
+        return {"error": f"No repos found matching: {repos}"}
+
+    current = []
+    for r in resolved:
+        current.append({
+            "repo": r.full_name,
+            "current": "private" if r.private else "public",
+            "target": visibility,
+            "already_set": (r.private == make_private),
+        })
+
+    result = {
+        "visibility": visibility,
+        "total": len(resolved),
+        "already_set": sum(1 for c in current if c["already_set"]),
+        "to_change": sum(1 for c in current if not c["already_set"]),
+        "not_found": not_found,
+        "repos": current,
+    }
+
+    if json_output:
+        from ..display import to_json
+        console.print(to_json(result))
+        return result
+
+    # Show preview
+    console.print(f"\n[bold]Changing visibility to [cyan]{visibility}[/] for {len(resolved)} repos:[/]\n")
+    for c in current:
+        if c["already_set"]:
+            console.print(f"  [dim]✓ {c['repo']} — already {visibility}[/]")
+        else:
+            console.print(f"  [yellow]→ {c['repo']}  [{c['current']}] → [{visibility}][/]")
+
+    if not_found:
+        console.print(f"\n[dim]Not found: {', '.join(not_found)}[/]")
+
+    if result["to_change"] == 0:
+        console.print(f"\n[green]All repos are already {visibility}.[/]")
+        return result
+
+    if dry_run:
+        console.print(f"\n[yellow]Dry run — {result['to_change']} repos would be changed. Run with --no-dry-run to apply.[/]")
+        return result
+
+    # Apply changes
+    changed = []
+    failed = []
+    for c in current:
+        if c["already_set"]:
+            continue
+        repo = client.get_repo(c["repo"])
+        if not repo:
+            failed.append({"repo": c["repo"], "error": "not found"})
+            continue
+
+        try:
+            repo.edit(private=make_private)
+            changed.append(c["repo"])
+            print_success(f"Changed {c['repo']} → {visibility}")
+        except Exception as pygh_error:
+            # Fall back to gh CLI
+            print_warning(f"PyGithub failed for {c['repo']}: {pygh_error}. Trying gh CLI...")
+            try:
+                subprocess.run(
+                    ["gh", "repo", "edit", c["repo"], "--visibility", visibility],
+                    capture_output=True, text=True, timeout=30, check=True,
+                )
+                changed.append(c["repo"])
+                print_success(f"Changed {c['repo']} → {visibility} (via gh CLI)")
+            except Exception as cli_error:
+                failed.append({"repo": c["repo"], "error": str(cli_error)})
+                print_error(f"Failed {c['repo']}: {cli_error}")
+
+    result["changed"] = changed
+    result["failed"] = failed
+    return result

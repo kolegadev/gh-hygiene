@@ -18,6 +18,8 @@ DESTRUCTIVE_TOOLS = {
     "clean_pr_branches",
     "clean_files",
     "reorganize_files",
+    "change_visibility",
+    "run_shell_command",
 }
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
@@ -221,7 +223,105 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "change_visibility",
+            "description": "Change repo visibility between public and private. Falls back to gh CLI if PyGithub fails. DESTRUCTIVE — always call with dry_run=True first to preview, then ask user for confirmation before dry_run=False.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repos": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of repo full names (e.g. 'owner/repo') to change visibility for",
+                    },
+                    "visibility": {
+                        "type": "string",
+                        "enum": ["private", "public"],
+                        "description": "Target visibility",
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "If true, only preview what would be changed without making changes",
+                    },
+                },
+                "required": ["repos", "visibility", "dry_run"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_shell_command",
+            "description": "Run a shell command on the user's machine as a fallback when no dedicated tool exists. Use this for operations not covered by other tools (e.g. gh CLI commands, git operations). Returns stdout and stderr. DESTRUCTIVE — always call with dry_run=True first to preview the command, then ask for confirmation before dry_run=False.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The shell command to run",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Human-readable description of what the command does",
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "If true, only show the command without executing it",
+                    },
+                },
+                "required": ["command", "description", "dry_run"],
+            },
+        },
+    },
 ]
+
+# ---------------------------------------------------------------------------
+# run_shell_command — CLI fallback tool
+# ---------------------------------------------------------------------------
+
+def run_shell_command(command: str, description: str = "", dry_run: bool = True, **kwargs) -> dict:
+    """Run a shell command as a fallback for operations not covered by other tools.
+
+    In dry-run mode, just returns the command without executing.
+    When confirmed, runs the command and returns stdout/stderr.
+    """
+    result = {
+        "command": command,
+        "description": description,
+    }
+
+    if dry_run:
+        result["status"] = "dry_run"
+        result["message"] = f"Would run: {command}"
+        return result
+
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        result["status"] = "success" if proc.returncode == 0 else "error"
+        result["returncode"] = proc.returncode
+        result["stdout"] = proc.stdout[:5000]  # Truncate for LLM context
+        result["stderr"] = proc.stderr[:2000]
+        if proc.returncode != 0:
+            result["message"] = f"Command failed with exit code {proc.returncode}"
+    except subprocess.TimeoutExpired:
+        result["status"] = "timeout"
+        result["message"] = "Command timed out after 120s"
+    except Exception as e:
+        result["status"] = "error"
+        result["message"] = str(e)
+
+    return result
+
 
 # ---------------------------------------------------------------------------
 # Late binding function registry — populated at runtime by the CLI
