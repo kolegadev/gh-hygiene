@@ -384,27 +384,56 @@
 </div>
 
 <script>
+// --- Debug banner ---
+const DEBUG = document.createElement('div');
+DEBUG.style.cssText = 'position:fixed;bottom:0;left:0;right:0;background:#111;color:#4ec9b0;font:11px monospace;padding:6px 12px;z-index:999;max-height:120px;overflow-y:auto;border-top:1px solid #2a2a2a;';
+DEBUG.id = 'debug-log';
+document.body.appendChild(DEBUG);
+function debug(msg) {
+  DEBUG.textContent += '[' + new Date().toLocaleTimeString() + '] ' + msg + '\n';
+  DEBUG.scrollTop = DEBUG.scrollHeight;
+}
+
+try {
+debug('Script starting...');
+
 const chat = document.getElementById('chat');
 const input = document.getElementById('msg-input');
 const sendBtn = document.getElementById('send-btn');
 const statusDot = document.getElementById('status-dot');
 const statusText = document.getElementById('status-text');
 
+debug('Elements found: chat=' + !!chat + ' input=' + !!input + ' sendBtn=' + !!sendBtn + ' statusDot=' + !!statusDot + ' statusText=' + !!statusText);
+
 let ws = null;
 let pendingConfirm = false;
 let isProcessing = false;
 
 function connect() {
+  debug('connect() called');
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  // Force IPv4 — localhost can resolve to ::1 which isn't bound
   const host = location.hostname === 'localhost' || location.hostname === '::1'
     ? '127.0.0.1:' + location.port
     : location.host;
   const url = protocol + '//' + host + '/ws/chat';
-  statusText.textContent = 'connecting to ' + url + '...';
-  ws = new WebSocket(url);
+  debug('WebSocket URL: ' + url);
+  
+  try {
+    statusText.textContent = 'connecting to ' + url + '...';
+  } catch(e) {
+    debug('statusText ERROR: ' + e.message);
+  }
+
+  try {
+    ws = new WebSocket(url);
+    debug('WebSocket created, readyState=' + ws.readyState);
+  } catch(e) {
+    debug('WebSocket constructor ERROR: ' + e.message);
+    return;
+  }
 
   ws.onopen = () => {
+    debug('WS onopen fired');
     setStatus(true, 'connected');
     input.disabled = false;
     sendBtn.disabled = false;
@@ -412,6 +441,7 @@ function connect() {
   };
 
   ws.onclose = (e) => {
+    debug('WS onclose fired, code=' + e.code + ' reason=' + (e.reason || 'none') + ' wasClean=' + e.wasClean);
     setStatus(false, 'disconnected (code ' + e.code + ')');
     input.disabled = true;
     sendBtn.disabled = true;
@@ -421,13 +451,16 @@ function connect() {
   ws.onmessage = (e) => {
     try {
       const msg = JSON.parse(e.data);
+      debug('WS msg: type=' + msg.type);
       handleMessage(msg);
     } catch (err) {
+      debug('WS parse error: ' + err.message);
       setStatus(false, 'parse error: ' + err.message);
     }
   };
 
   ws.onerror = (e) => {
+    debug('WS onerror fired, readyState=' + ws.readyState);
     setStatus(false, 'ws error');
   };
 }
@@ -786,6 +819,10 @@ input.addEventListener('keydown', (e) => {
 sendBtn.addEventListener('click', sendMessage);
 
 connect();
+} catch(e) {
+  debug('FATAL SCRIPT ERROR: ' + e.message + ' (line ' + e.lineNumber + ')');
+  statusText.textContent = 'JS Error: ' + e.message;
+}
 </script>
 <!-- Settings Modal -->
 <div class="modal-overlay" id="modal-overlay">
