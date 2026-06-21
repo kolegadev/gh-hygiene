@@ -493,7 +493,12 @@ function connect() {
   ws.onmessage = (e) => {
     try {
       const msg = JSON.parse(e.data);
-      debug('WS msg: type=' + msg.type);
+      const info = msg.type === 'thinking' ? (' (' + (msg.content||'') + ')') :
+                   msg.type === 'tool_calls' ? (' [' + (msg.tools||[]).map(t=>t.name).join(', ') + ']') :
+                   msg.type === 'error' ? (': ' + (msg.content||'')) :
+                   msg.type === 'confirm_request' ? (' [' + (msg.tools||[]).join(', ') + ']') :
+                   '';
+      debug('WS msg: type=' + msg.type + info);
       handleMessage(msg);
     } catch (err) {
       debug('WS parse error: ' + err.message);

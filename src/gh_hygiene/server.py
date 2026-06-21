@@ -218,6 +218,8 @@ class WebSocketChatSession:
     async def _run_llm_loop(self, max_iterations: int = 50):
         """Core LLM loop adapted for WebSocket, with cancellation support."""
         for i in range(max_iterations):
+            await self._send({"type": "thinking", "content": f"Step {i+1}/{max_iterations}..."})
+
             if self._cancel_event.is_set():
                 self.session._messages.append({
                     "role": "system",
@@ -1030,7 +1032,12 @@ function connect() {
   ws.onmessage = (e) => {
     try {
       const msg = JSON.parse(e.data);
-      debug('WS msg: type=' + msg.type);
+      const info = msg.type === 'thinking' ? (' (' + (msg.content||'') + ')') :
+                   msg.type === 'tool_calls' ? (' [' + (msg.tools||[]).map(t=>t.name).join(', ') + ']') :
+                   msg.type === 'error' ? (': ' + (msg.content||'')) :
+                   msg.type === 'confirm_request' ? (' [' + (msg.tools||[]).join(', ') + ']') :
+                   '';
+      debug('WS msg: type=' + msg.type + info);
       handleMessage(msg);
     } catch (err) {
       debug('WS parse error: ' + err.message);
