@@ -409,11 +409,30 @@
 <script>
 // --- Debug banner ---
 const DEBUG = document.createElement('div');
-DEBUG.style.cssText = 'position:fixed;bottom:0;left:0;right:0;background:#111;color:#4ec9b0;font:11px monospace;padding:6px 12px;z-index:999;max-height:120px;overflow-y:auto;border-top:1px solid #2a2a2a;';
+DEBUG.style.cssText = 'position:fixed;bottom:76px;left:8px;right:8px;background:#111;color:#4ec9b0;font:11px monospace;padding:6px 10px;z-index:999;max-height:60px;overflow-y:auto;border-radius:6px;border:1px solid #2a2a2a;opacity:0.92;';
 DEBUG.id = 'debug-log';
+const DBG_CLOSE = document.createElement('span');
+DBG_CLOSE.textContent = '×';
+DBG_CLOSE.style.cssText = 'position:absolute;top:2px;right:8px;cursor:pointer;color:#6b6b6b;font-size:14px;';
+DBG_CLOSE.onclick = function() { DEBUG.style.display = 'none'; };
+DEBUG.appendChild(DBG_CLOSE);
+const DBG_TEXT = document.createElement('pre');
+DBG_TEXT.style.cssText = 'margin:0;white-space:pre-wrap;word-break:break-all;';
+DEBUG.appendChild(DBG_TEXT);
 document.body.appendChild(DEBUG);
+
+let _dbgTimeout = null;
 function debug(msg) {
-  DEBUG.textContent += '[' + new Date().toLocaleTimeString() + '] ' + msg + '\n';
+  DEBUG.style.display = 'block';
+  if (msg.includes('WS onopen fired')) {
+    _dbgTimeout = setTimeout(function() { DEBUG.style.display = 'none'; }, 3000);
+  }
+  if (msg.includes('FATAL') || msg.includes('ERROR')) {
+    DEBUG.style.color = '#f44747';
+    DEBUG.style.borderColor = 'rgba(244,71,71,0.4)';
+    if (_dbgTimeout) clearTimeout(_dbgTimeout);
+  }
+  DBG_TEXT.textContent += '[' + new Date().toLocaleTimeString() + '] ' + msg + '\n';
   DEBUG.scrollTop = DEBUG.scrollHeight;
 }
 
