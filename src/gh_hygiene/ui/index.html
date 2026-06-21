@@ -815,9 +815,20 @@ function removeConfirmBar() {
   if (el) el.remove();
 }
 
-// --- Settings Modal ---
+input.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); sendMessage(); }
+});
+sendBtn.addEventListener('click', sendMessage);
 
-async function openSettings() {
+connect();
+} catch(e) {
+  debug('FATAL SCRIPT ERROR: ' + e.message + ' (line ' + e.lineNumber + ')');
+  statusText.textContent = 'JS Error: ' + e.message;
+}
+
+// --- Settings Modal (on window for onclick compatibility) ---
+
+window.openSettings = async function() {
   debug('openSettings() called');
   const overlay = document.getElementById('modal-overlay');
   overlay.classList.add('open');
@@ -839,13 +850,13 @@ async function openSettings() {
     document.getElementById('settings-user').textContent = 'error';
     document.getElementById('settings-source').textContent = e.message;
   }
-}
+};
 
-function closeSettings() {
+window.closeSettings = function() {
   document.getElementById('modal-overlay').classList.remove('open');
-}
+};
 
-async function saveSettings() {
+window.saveSettings = async function() {
   debug('saveSettings() called');
   const ghToken = document.getElementById('settings-gh-token').value.trim();
   const dsKey = document.getElementById('settings-ds-key').value.trim();
@@ -894,23 +905,13 @@ async function saveSettings() {
     saveBtn.textContent = 'Save & Reconnect';
     saveBtn.disabled = false;
   }
-}
+};
 
-document.getElementById('settings-btn').addEventListener('click', openSettings);
+document.getElementById('settings-btn').addEventListener('click', window.openSettings);
 document.getElementById('modal-overlay').addEventListener('click', (e) => {
-  if (e.target === e.currentTarget) closeSettings();
+  if (e.target === e.currentTarget) window.closeSettings();
 });
 
-input.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') { e.preventDefault(); sendMessage(); }
-});
-sendBtn.addEventListener('click', sendMessage);
-
-connect();
-} catch(e) {
-  debug('FATAL SCRIPT ERROR: ' + e.message + ' (line ' + e.lineNumber + ')');
-  statusText.textContent = 'JS Error: ' + e.message;
-}
 </script>
 
 </body>
