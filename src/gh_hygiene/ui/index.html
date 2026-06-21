@@ -247,6 +247,104 @@
     opacity: 0.4;
     cursor: not-allowed;
   }
+  .input-container button.btn-stop {
+    background: var(--red);
+    animation: pulseStop 1.5s infinite;
+  }
+  @keyframes pulseStop {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.7; }
+  }
+
+  /* Settings modal */
+  .settings-btn {
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text-dim);
+    font-size: 16px;
+    padding: 4px 8px;
+    cursor: pointer;
+    transition: all 0.15s;
+    margin-right: 8px;
+  }
+  .settings-btn:hover { color: var(--text); border-color: var(--text-dim); }
+  .modal-overlay {
+    display: none;
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0,0,0,0.7);
+    z-index: 100;
+    align-items: center;
+    justify-content: center;
+  }
+  .modal-overlay.open { display: flex; }
+  .modal {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+    width: 90%;
+    max-width: 440px;
+    animation: fadeIn 0.2s ease;
+  }
+  .modal h2 { font-size: 18px; color: var(--accent); margin-bottom: 20px; }
+  .modal label { font-size: 12px; color: var(--text-dim); display: block; margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .modal input {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 10px 12px;
+    color: var(--text);
+    font-size: 13px;
+    font-family: var(--mono);
+    margin-bottom: 14px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .modal input:focus { border-color: var(--accent); }
+  .modal .account-info {
+    background: var(--surface2);
+    border-radius: var(--radius);
+    padding: 10px 14px;
+    margin-bottom: 16px;
+    font-size: 13px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .modal .account-info .dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--green);
+    flex-shrink: 0;
+  }
+  .modal .account-info .dot.off { background: var(--red); }
+  .modal .account-info .label { color: var(--text-dim); }
+  .modal .account-info .value { color: var(--accent); font-weight: 600; }
+  .modal .account-info .source { color: var(--text-dim); font-size: 11px; }
+  .modal .btn-row { display: flex; gap: 10px; justify-content: flex-end; margin-top: 6px; }
+  .modal .btn-row button {
+    padding: 8px 18px;
+    border-radius: 5px;
+    border: none;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .modal .btn-save { background: var(--accent); color: #1a1a1a; }
+  .modal .btn-save:hover { filter: brightness(1.1); }
+  .modal .btn-cancel { background: transparent; color: var(--text-dim); border: 1px solid var(--border); }
+  .modal .btn-cancel:hover { color: var(--text); }
+  .modal .saved-msg {
+    text-align: center;
+    color: var(--green);
+    font-size: 13px;
+    margin-top: 10px;
+    display: none;
+  }
 
   /* Loading dots */
   .typing-dots {
@@ -270,6 +368,8 @@
 <header>
   <div class="logo">gh-hygiene <span>/ repo manager</span></div>
   <div class="status">
+    <button class="settings-btn" id="settings-btn" title="Settings">⚙</button>
+    <span id="github-user" style="color:var(--accent);font-weight:600;font-size:12px;margin-right:12px;"></span>
     <div class="status-dot" id="status-dot"></div>
     <span id="status-text">connecting...</span>
   </div>
@@ -291,6 +391,7 @@ const statusText = document.getElementById('status-text');
 
 let ws = null;
 let pendingConfirm = false;
+let isProcessing = false;
 
 function connect() {
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -325,25 +426,66 @@ function setStatus(ok, text) {
   statusText.textContent = text;
 }
 
+function setIsProcessing(processing) {
+  isProcessing = processing;
+  if (processing) {
+    sendBtn.textContent = 'Stop';
+    sendBtn.className = 'btn-stop';
+    sendBtn.disabled = false;
+  } else {
+    sendBtn.textContent = 'Send';
+    sendBtn.className = '';
+    sendBtn.disabled = false;
+  }
+}
+
 function handleMessage(msg) {
   removeTyping();
 
   switch (msg.type) {
-    case 'text':
+    case 'connected':
+      setStatus(true, 'connected');
+      setIsProcessing(false);
+      if (msg.github_user) {
+        document.getElementById('github-user').textContent = '@' + msg.github_user;
+      }
       addMessage('assistant', msg.content);
+      break;
+    case 'text':
+      setIsProcessing(false);
+      addMessage('assistant', msg.content);
+      break;
+    case 'text_chunk':
+      appendStreamingText(msg.content);
+      break;
+    case 'text_end':
+      finalizeStreamingText();
       break;
     case 'tool_calls':
       addToolCalls(msg.content, msg.tools);
+      addTyping();
       break;
     case 'confirm_request':
+      setIsProcessing(false);
       addConfirmBar(msg.content, msg.tools);
       pendingConfirm = true;
+      break;
+    case 'thinking':
+      addTyping();
       break;
     case 'status':
       addMessage('system', msg.content);
       break;
+    case 'cancelled':
+      setIsProcessing(false);
+      if (msg.content) addMessage('system', msg.content, true);
+      break;
     case 'error':
+      setIsProcessing(false);
       addMessage('system', msg.content, true);
+      break;
+    case 'tool_result':
+      addToolResult(msg);
       break;
     case 'pong':
       break;
@@ -359,6 +501,61 @@ function addMessage(role, content, isError = false) {
   bubble.className = 'msg-bubble';
   bubble.innerHTML = renderMarkdown(content);
   div.appendChild(bubble);
+  
+  chat.appendChild(div);
+}
+
+function addToolResult(msg) {
+  removeTyping();
+  const div = document.createElement('div');
+  div.className = 'msg assistant';
+  div.style.maxWidth = '95%';
+  
+  // Header
+  const header = document.createElement('div');
+  header.style.cssText = 'font-size:13px;color:var(--text-dim);margin-bottom:8px;';
+  header.textContent = msg.message || (msg.tool + ' results');
+  div.appendChild(header);
+  
+  // Repo list grid
+  const grid = document.createElement('div');
+  grid.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;';
+  
+  const repos = Array.isArray(msg.content) ? msg.content : [];
+  const show = repos.slice(0, 50); // Show first 50 in grid
+  const remaining = repos.length - show.length;
+  
+  show.forEach(r => {
+    const card = document.createElement('div');
+    card.style.cssText = 'background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:8px 10px;font-size:13px;min-width:200px;flex:1;max-width:320px;';
+    card.innerHTML = `
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px;">
+        <strong style="color:var(--accent);font-size:13px;">${esc(r.name)}</strong>
+        <span style="font-size:10px;color:var(--text-dim);">${r.visibility === 'private' ? '🔒' : '🌐'}</span>
+      </div>
+      <div style="color:var(--text-dim);font-size:11px;line-height:1.4;">${esc(r.description || '')}</div>
+      <div style="display:flex;gap:8px;margin-top:4px;font-size:10px;color:var(--text-dim);">
+        ${r.language ? '<span style="color:var(--blue);">' + esc(r.language) + '</span>' : ''}
+        <span>⭐ ' + (r.stars || 0) + '</span>
+        <span>' + esc(r.last_push || '') + '</span>
+      </div>
+    `;
+    grid.appendChild(card);
+  });
+  div.appendChild(grid);
+  
+  if (remaining > 0) {
+    const more = document.createElement('div');
+    more.style.cssText = 'text-align:center;padding:8px;color:var(--text-dim);font-size:12px;margin-top:4px;';
+    more.textContent = '... and ' + remaining + ' more repos';
+    div.appendChild(more);
+  }
+  
+  // Total count
+  const total = document.createElement('div');
+  total.style.cssText = 'text-align:right;font-size:11px;color:var(--text-dim);margin-top:8px;border-top:1px solid var(--border);padding-top:6px;';
+  total.textContent = 'Total: ' + repos.length + ' repositories';
+  div.appendChild(total);
   
   chat.appendChild(div);
 }
@@ -437,16 +634,48 @@ function esc(s) {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+let streamingEl = null;
+
+function appendStreamingText(content) {
+  if (!streamingEl) {
+    removeTyping();
+    streamingEl = document.createElement('div');
+    streamingEl.className = 'msg assistant';
+    const bubble = document.createElement('div');
+    bubble.className = 'msg-bubble';
+    bubble.id = 'streaming-bubble';
+    streamingEl.appendChild(bubble);
+    chat.appendChild(streamingEl);
+  }
+  const bubble = document.getElementById('streaming-bubble');
+  if (bubble) {
+    bubble.innerHTML += renderMarkdown(content.replace(/\n/g, '<br>'));
+  }
+  scrollDown();
+}
+
+function finalizeStreamingText() {
+  streamingEl = null;
+}
+
 function scrollDown() {
   chat.scrollTop = chat.scrollHeight;
 }
 
 function sendMessage() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+  if (isProcessing) {
+    ws.send(JSON.stringify({ type: 'stop' }));
+    return;
+  }
+
   const text = input.value.trim();
-  if (!text || !ws || ws.readyState !== WebSocket.OPEN || pendingConfirm) return;
+  if (!text || pendingConfirm) return;
 
   addMessage('user', text);
   input.value = '';
+  setIsProcessing(true);
   addTyping();
 
   ws.send(JSON.stringify({ type: 'message', content: text }));
@@ -456,6 +685,7 @@ function confirmAction() {
   if (!ws || !pendingConfirm) return;
   removeConfirmBar();
   pendingConfirm = false;
+  setIsProcessing(true);
   addTyping();
   ws.send(JSON.stringify({ type: 'confirm' }));
 }
@@ -464,6 +694,7 @@ function rejectAction() {
   if (!ws || !pendingConfirm) return;
   removeConfirmBar();
   pendingConfirm = false;
+  setIsProcessing(true);
   addTyping();
   ws.send(JSON.stringify({ type: 'reject' }));
 }
@@ -473,6 +704,71 @@ function removeConfirmBar() {
   if (el) el.remove();
 }
 
+// --- Settings Modal ---
+
+async function openSettings() {
+  const overlay = document.getElementById('modal-overlay');
+  overlay.classList.add('open');
+
+  try {
+    const resp = await fetch('/api/account');
+    const data = await resp.json();
+
+    document.getElementById('settings-user').textContent = data.github_user || 'not connected';
+    document.getElementById('settings-source').textContent = 'via ' + data.github_source;
+    const dot = document.getElementById('settings-dot');
+    dot.className = dot.className.replace(' off', '');
+    if (!data.github_configured) dot.className += ' off';
+
+    document.getElementById('settings-gh-token').value = '';
+    document.getElementById('settings-ds-key').value = '';
+    document.getElementById('saved-msg').style.display = 'none';
+  } catch (e) {
+    document.getElementById('settings-user').textContent = 'error';
+    document.getElementById('settings-source').textContent = e.message;
+  }
+}
+
+function closeSettings() {
+  document.getElementById('modal-overlay').classList.remove('open');
+}
+
+async function saveSettings() {
+  const ghToken = document.getElementById('settings-gh-token').value.trim();
+  const dsKey = document.getElementById('settings-ds-key').value.trim();
+
+  if (!ghToken && !dsKey) return;
+
+  const body = {};
+  if (ghToken) body.github_token = ghToken;
+  if (dsKey) body.deepseek_key = dsKey;
+
+  try {
+    const resp = await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json();
+
+    if (data.status === 'ok') {
+      document.getElementById('saved-msg').style.display = 'block';
+      setTimeout(() => {
+        location.reload();
+      }, 1200);
+    }
+  } catch (e) {
+    document.getElementById('saved-msg').textContent = 'Error: ' + e.message;
+    document.getElementById('saved-msg').style.color = 'var(--red)';
+    document.getElementById('saved-msg').style.display = 'block';
+  }
+}
+
+document.getElementById('settings-btn').addEventListener('click', openSettings);
+document.getElementById('modal-overlay').addEventListener('click', (e) => {
+  if (e.target === e.currentTarget) closeSettings();
+});
+
 input.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') { e.preventDefault(); sendMessage(); }
 });
@@ -480,5 +776,28 @@ sendBtn.addEventListener('click', sendMessage);
 
 connect();
 </script>
+<!-- Settings Modal -->
+<div class="modal-overlay" id="modal-overlay">
+  <div class="modal">
+    <h2>Settings</h2>
+    <div class="account-info" id="settings-account">
+      <div class="dot" id="settings-dot"></div>
+      <div>
+        <div>Connected as <span class="value" id="settings-user">...</span></div>
+        <div class="source" id="settings-source">loading...</div>
+      </div>
+    </div>
+    <label>GitHub Personal Access Token</label>
+    <input type="password" id="settings-gh-token" placeholder="ghp_... (leave blank to keep current)" />
+    <label>DeepSeek API Key</label>
+    <input type="password" id="settings-ds-key" placeholder="sk-... (leave blank to keep current)" />
+    <div class="btn-row">
+      <button class="btn-cancel" onclick="closeSettings()">Cancel</button>
+      <button class="btn-save" onclick="saveSettings()">Save &amp; Reconnect</button>
+    </div>
+    <div class="saved-msg" id="saved-msg">Saved! Reconnecting...</div>
+  </div>
+</div>
+
 </body>
 </html>

@@ -14,8 +14,8 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Body
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
 
@@ -46,11 +46,13 @@ UI_DIR.mkdir(exist_ok=True)
 
 @app.get("/")
 async def root():
-    """Serve the chat UI."""
-    index_path = UI_DIR / "index.html"
-    if index_path.exists():
-        return HTMLResponse(index_path.read_text())
-    return HTMLResponse("<h1>UI not found. Run gh-hygiene serve to generate it.</h1>")
+    """Serve the chat UI — always fresh from code, no caching."""
+    headers = {
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    }
+    return HTMLResponse(content=_get_ui_html(), headers=headers)
 
 
 @app.get("/api/health")
@@ -79,10 +81,10 @@ async def account():
 
 
 @app.post("/api/settings")
-async def update_settings(data: dict):
+async def update_settings(data: dict = Body(...)):
     """Update GitHub PAT and/or DeepSeek API key."""
-    gh_token = data.get("github_token")
-    ds_key = data.get("deepseek_key")
+    gh_token = (data.get("github_token") or "").strip()
+    ds_key = (data.get("deepseek_key") or "").strip()
 
     updates = []
     if gh_token:
@@ -1247,8 +1249,7 @@ async function saveSettings() {
     if (data.status === 'ok') {
       document.getElementById('saved-msg').style.display = 'block';
       setTimeout(() => {
-        closeSettings();
-        if (ws) ws.close();
+        window.location.reload(true);
       }, 1200);
     }
   } catch (e) {

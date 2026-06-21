@@ -37,23 +37,23 @@ def get_github_token() -> Optional[str]:
 
     Returns None if no token can be found.
     """
-    # 1. gh CLI
-    token = _token_from_gh_cli()
-    if token:
-        return token
-
-    # 2. macOS Keychain
+    # 1. macOS Keychain (explicitly saved via settings — highest priority)
     token = _token_from_keychain(KEYRING_ACCOUNT_GITHUB)
     if token:
         return token
 
-    # 3. Environment variable
-    token = os.environ.get(ENV_GITHUB_TOKEN)
+    # 2. Config file (fallback for systems without keychain)
+    token = get_config_value("github_token")
     if token:
         return token
 
-    # 4. Config file
-    token = get_config_value("github_token")
+    # 3. gh CLI (system-level auth)
+    token = _token_from_gh_cli()
+    if token:
+        return token
+
+    # 4. Environment variable
+    token = os.environ.get(ENV_GITHUB_TOKEN)
     if token:
         return token
 
