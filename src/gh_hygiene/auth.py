@@ -136,6 +136,19 @@ def _store_in_keychain(account: str, secret: str) -> None:
             set_config_value("deepseek_api_key", secret)
 
 
+def get_github_username() -> Optional[str]:
+    """Return the authenticated GitHub username using the resolved token."""
+    token = get_github_token()
+    if not token:
+        return None
+    try:
+        from github import Github
+        gh = Github(token)
+        return gh.get_user().login
+    except Exception:
+        return None
+
+
 def get_token_source() -> str:
     """Return a human-readable string describing where the GitHub token came from."""
     if _token_from_gh_cli():

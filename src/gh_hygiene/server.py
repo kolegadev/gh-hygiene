@@ -19,7 +19,7 @@ from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
 
-from .auth import get_github_token, get_deepseek_api_key, get_token_source
+from .auth import get_github_token, get_deepseek_api_key, get_token_source, get_github_username, store_github_token, store_deepseek_key
 from .client import GitHubClient
 from .chat import ChatSession
 from .tools import register_tool
@@ -66,6 +66,39 @@ async def health():
     }
 
 
+@app.get("/api/account")
+async def account():
+    """Return the current GitHub account info."""
+    username = get_github_username()
+    return {
+        "github_user": username,
+        "github_configured": username is not None,
+        "deepseek_configured": get_deepseek_api_key() is not None,
+        "github_source": get_token_source(),
+    }
+
+
+@app.post("/api/settings")
+async def update_settings(data: dict):
+    """Update GitHub PAT and/or DeepSeek API key."""
+    gh_token = data.get("github_token")
+    ds_key = data.get("deepseek_key")
+
+    updates = []
+    if gh_token:
+        store_github_token(gh_token)
+        updates.append("github_token")
+    if ds_key:
+        store_deepseek_key(ds_key)
+        updates.append("deepseek_key")
+
+    return {
+        "status": "ok",
+        "updated": updates,
+        "message": "Settings saved. Reconnect to use new credentials.",
+    }
+
+
 # ---------------------------------------------------------------------------
 # WebSocket chat
 # ---------------------------------------------------------------------------
@@ -84,6 +117,8 @@ class WebSocketChatSession:
         self.session = session
         self.client = client
         self._confirm_future: Optional[asyncio.Future] = None
+        self._cancel_event = asyncio.Event()
+        self._is_processing = False
 
     async def run(self):
         """Main loop: listen for client messages, process through LLM."""
@@ -102,6 +137,11 @@ class WebSocketChatSession:
                 elif msg_type == "reject":
                     await self._handle_reject()
 
+                elif msg_type == "stop":
+                    if self._is_processing:
+                        self._cancel_event.set()
+                        await self._send({"type": "status", "content": "Cancelling..."})
+
                 elif msg_type == "ping":
                     await self.ws.send_text(json.dumps({"type": "pong"}))
 
@@ -110,22 +150,28 @@ class WebSocketChatSession:
 
     async def _handle_message(self, content: str):
         """Send user message, checking for intent fast-paths first."""
-        # Try intent fast-path for common queries
-        if self.client:
-            from .intents import detect_intent
-            intent = detect_intent(content)
+        self._is_processing = True
+        self._cancel_event.clear()
 
-            if intent == "list_repos":
-                await self._fast_list_repos(content)
-                return
+        try:
+            # Try intent fast-path for common queries
+            if self.client:
+                from .intents import detect_intent
+                intent = detect_intent(content)
 
-            if intent == "audit_repos":
-                # Fall through to LLM for audit (needs LLM analysis)
-                pass
+                if intent == "list_repos":
+                    await self._fast_list_repos(content)
+                    return
 
-        # Default: use LLM
-        self.session._messages.append({"role": "user", "content": content})
-        await self._run_llm_loop()
+                if intent == "audit_repos":
+                    # Fall through to LLM for audit (needs LLM analysis)
+                    pass
+
+            # Default: use LLM
+            self.session._messages.append({"role": "user", "content": content})
+            await self._run_llm_loop()
+        finally:
+            self._is_processing = False
 
     async def _fast_list_repos(self, user_message: str):
         """Fast-path: return cached repo list directly, then LLM follow-up."""
@@ -166,8 +212,20 @@ class WebSocketChatSession:
             await self._send({"type": "error", "content": f"Failed to fetch repos: {e}"})
 
     async def _run_llm_loop(self, max_iterations: int = 10):
-        """Core LLM loop adapted for WebSocket."""
+        """Core LLM loop adapted for WebSocket, with cancellation support."""
         for _ in range(max_iterations):
+            if self._cancel_event.is_set():
+                self.session._messages.append({
+                    "role": "system",
+                    "content": "The user interrupted this task. Acknowledge and ask what they'd like to do next."
+                })
+                response = await asyncio.to_thread(self.session._call_llm)
+                if response and response.choices[0].message.content:
+                    self.session._messages.append({"role": "assistant", "content": response.choices[0].message.content})
+                    await self._send({"type": "text", "content": response.choices[0].message.content})
+                await self._send({"type": "cancelled", "content": "Task interrupted."})
+                return
+
             response = await asyncio.to_thread(self.session._call_llm)
 
             if response is None:
@@ -223,6 +281,10 @@ class WebSocketChatSession:
                 # Process each tool call
                 all_read_only = True
                 for tc in message.tool_calls:
+                    if self._cancel_event.is_set():
+                        await self._send({"type": "cancelled", "content": "Task interrupted."})
+                        return
+
                     result = self.session._handle_tool_call(
                         tc.id, tc.function.name, tc.function.arguments
                     )
@@ -248,9 +310,14 @@ class WebSocketChatSession:
                 # If all tools were read-only, continue the loop
                 if all_read_only:
                     await self._send({
-                        "type": "status",
+                        "type": "thinking",
                         "content": "Tools executed, continuing...",
                     })
+
+                    if self._cancel_event.is_set():
+                        await self._send({"type": "cancelled", "content": "Task interrupted."})
+                        return
+
                     continue
                 else:
                     return
@@ -673,6 +740,104 @@ def _get_ui_html() -> str:
     opacity: 0.4;
     cursor: not-allowed;
   }
+  .input-container button.btn-stop {
+    background: var(--red);
+    animation: pulseStop 1.5s infinite;
+  }
+  @keyframes pulseStop {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.7; }
+  }
+
+  /* Settings modal */
+  .settings-btn {
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text-dim);
+    font-size: 16px;
+    padding: 4px 8px;
+    cursor: pointer;
+    transition: all 0.15s;
+    margin-right: 8px;
+  }
+  .settings-btn:hover { color: var(--text); border-color: var(--text-dim); }
+  .modal-overlay {
+    display: none;
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0,0,0,0.7);
+    z-index: 100;
+    align-items: center;
+    justify-content: center;
+  }
+  .modal-overlay.open { display: flex; }
+  .modal {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+    width: 90%;
+    max-width: 440px;
+    animation: fadeIn 0.2s ease;
+  }
+  .modal h2 { font-size: 18px; color: var(--accent); margin-bottom: 20px; }
+  .modal label { font-size: 12px; color: var(--text-dim); display: block; margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .modal input {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 10px 12px;
+    color: var(--text);
+    font-size: 13px;
+    font-family: var(--mono);
+    margin-bottom: 14px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .modal input:focus { border-color: var(--accent); }
+  .modal .account-info {
+    background: var(--surface2);
+    border-radius: var(--radius);
+    padding: 10px 14px;
+    margin-bottom: 16px;
+    font-size: 13px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .modal .account-info .dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--green);
+    flex-shrink: 0;
+  }
+  .modal .account-info .dot.off { background: var(--red); }
+  .modal .account-info .label { color: var(--text-dim); }
+  .modal .account-info .value { color: var(--accent); font-weight: 600; }
+  .modal .account-info .source { color: var(--text-dim); font-size: 11px; }
+  .modal .btn-row { display: flex; gap: 10px; justify-content: flex-end; margin-top: 6px; }
+  .modal .btn-row button {
+    padding: 8px 18px;
+    border-radius: 5px;
+    border: none;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .modal .btn-save { background: var(--accent); color: #1a1a1a; }
+  .modal .btn-save:hover { filter: brightness(1.1); }
+  .modal .btn-cancel { background: transparent; color: var(--text-dim); border: 1px solid var(--border); }
+  .modal .btn-cancel:hover { color: var(--text); }
+  .modal .saved-msg {
+    text-align: center;
+    color: var(--green);
+    font-size: 13px;
+    margin-top: 10px;
+    display: none;
+  }
 
   /* Loading dots */
   .typing-dots {
@@ -696,6 +861,7 @@ def _get_ui_html() -> str:
 <header>
   <div class="logo">gh-hygiene <span>/ repo manager</span></div>
   <div class="status">
+    <button class="settings-btn" id="settings-btn" title="Settings">⚙</button>
     <span id="github-user" style="color:var(--accent);font-weight:600;font-size:12px;margin-right:12px;"></span>
     <div class="status-dot" id="status-dot"></div>
     <span id="status-text">connecting...</span>
@@ -718,6 +884,7 @@ const statusText = document.getElementById('status-text');
 
 let ws = null;
 let pendingConfirm = false;
+let isProcessing = false;
 
 function connect() {
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -752,18 +919,33 @@ function setStatus(ok, text) {
   statusText.textContent = text;
 }
 
+function setIsProcessing(processing) {
+  isProcessing = processing;
+  if (processing) {
+    sendBtn.textContent = 'Stop';
+    sendBtn.className = 'btn-stop';
+    sendBtn.disabled = false;
+  } else {
+    sendBtn.textContent = 'Send';
+    sendBtn.className = '';
+    sendBtn.disabled = false;
+  }
+}
+
 function handleMessage(msg) {
   removeTyping();
 
   switch (msg.type) {
     case 'connected':
       setStatus(true, 'connected');
+      setIsProcessing(false);
       if (msg.github_user) {
         document.getElementById('github-user').textContent = '@' + msg.github_user;
       }
       addMessage('assistant', msg.content);
       break;
     case 'text':
+      setIsProcessing(false);
       addMessage('assistant', msg.content);
       break;
     case 'text_chunk':
@@ -774,15 +956,25 @@ function handleMessage(msg) {
       break;
     case 'tool_calls':
       addToolCalls(msg.content, msg.tools);
+      addTyping();
       break;
     case 'confirm_request':
+      setIsProcessing(false);
       addConfirmBar(msg.content, msg.tools);
       pendingConfirm = true;
+      break;
+    case 'thinking':
+      addTyping();
       break;
     case 'status':
       addMessage('system', msg.content);
       break;
+    case 'cancelled':
+      setIsProcessing(false);
+      if (msg.content) addMessage('system', msg.content, true);
+      break;
     case 'error':
+      setIsProcessing(false);
       addMessage('system', msg.content, true);
       break;
     case 'tool_result':
@@ -964,11 +1156,19 @@ function scrollDown() {
 }
 
 function sendMessage() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+  if (isProcessing) {
+    ws.send(JSON.stringify({ type: 'stop' }));
+    return;
+  }
+
   const text = input.value.trim();
-  if (!text || !ws || ws.readyState !== WebSocket.OPEN || pendingConfirm) return;
+  if (!text || pendingConfirm) return;
 
   addMessage('user', text);
   input.value = '';
+  setIsProcessing(true);
   addTyping();
 
   ws.send(JSON.stringify({ type: 'message', content: text }));
@@ -978,6 +1178,7 @@ function confirmAction() {
   if (!ws || !pendingConfirm) return;
   removeConfirmBar();
   pendingConfirm = false;
+  setIsProcessing(true);
   addTyping();
   ws.send(JSON.stringify({ type: 'confirm' }));
 }
@@ -986,6 +1187,7 @@ function rejectAction() {
   if (!ws || !pendingConfirm) return;
   removeConfirmBar();
   pendingConfirm = false;
+  setIsProcessing(true);
   addTyping();
   ws.send(JSON.stringify({ type: 'reject' }));
 }
@@ -995,6 +1197,72 @@ function removeConfirmBar() {
   if (el) el.remove();
 }
 
+// --- Settings Modal ---
+
+async function openSettings() {
+  const overlay = document.getElementById('modal-overlay');
+  overlay.classList.add('open');
+
+  try {
+    const resp = await fetch('/api/account');
+    const data = await resp.json();
+
+    document.getElementById('settings-user').textContent = data.github_user || 'not connected';
+    document.getElementById('settings-source').textContent = 'via ' + data.github_source;
+    const dot = document.getElementById('settings-dot');
+    dot.className = dot.className.replace(' off', '');
+    if (!data.github_configured) dot.className += ' off';
+
+    document.getElementById('settings-gh-token').value = '';
+    document.getElementById('settings-ds-key').value = '';
+    document.getElementById('saved-msg').style.display = 'none';
+  } catch (e) {
+    document.getElementById('settings-user').textContent = 'error';
+    document.getElementById('settings-source').textContent = e.message;
+  }
+}
+
+function closeSettings() {
+  document.getElementById('modal-overlay').classList.remove('open');
+}
+
+async function saveSettings() {
+  const ghToken = document.getElementById('settings-gh-token').value.trim();
+  const dsKey = document.getElementById('settings-ds-key').value.trim();
+
+  if (!ghToken && !dsKey) return;
+
+  const body = {};
+  if (ghToken) body.github_token = ghToken;
+  if (dsKey) body.deepseek_key = dsKey;
+
+  try {
+    const resp = await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json();
+
+    if (data.status === 'ok') {
+      document.getElementById('saved-msg').style.display = 'block';
+      setTimeout(() => {
+        closeSettings();
+        if (ws) ws.close();
+      }, 1200);
+    }
+  } catch (e) {
+    document.getElementById('saved-msg').textContent = 'Error: ' + e.message;
+    document.getElementById('saved-msg').style.color = 'var(--red)';
+    document.getElementById('saved-msg').style.display = 'block';
+  }
+}
+
+document.getElementById('settings-btn').addEventListener('click', openSettings);
+document.getElementById('modal-overlay').addEventListener('click', (e) => {
+  if (e.target === e.currentTarget) closeSettings();
+});
+
 input.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') { e.preventDefault(); sendMessage(); }
 });
@@ -1002,5 +1270,28 @@ sendBtn.addEventListener('click', sendMessage);
 
 connect();
 </script>
+<!-- Settings Modal -->
+<div class="modal-overlay" id="modal-overlay">
+  <div class="modal">
+    <h2>Settings</h2>
+    <div class="account-info" id="settings-account">
+      <div class="dot" id="settings-dot"></div>
+      <div>
+        <div>Connected as <span class="value" id="settings-user">...</span></div>
+        <div class="source" id="settings-source">loading...</div>
+      </div>
+    </div>
+    <label>GitHub Personal Access Token</label>
+    <input type="password" id="settings-gh-token" placeholder="ghp_... (leave blank to keep current)" />
+    <label>DeepSeek API Key</label>
+    <input type="password" id="settings-ds-key" placeholder="sk-... (leave blank to keep current)" />
+    <div class="btn-row">
+      <button class="btn-cancel" onclick="closeSettings()">Cancel</button>
+      <button class="btn-save" onclick="saveSettings()">Save &amp; Reconnect</button>
+    </div>
+    <div class="saved-msg" id="saved-msg">Saved! Reconnecting...</div>
+  </div>
+</div>
+
 </body>
 </html>'''
