@@ -46,13 +46,15 @@ UI_DIR.mkdir(exist_ok=True)
 
 @app.get("/")
 async def root():
-    """Serve the chat UI — always fresh from code, no caching."""
+    """Serve the chat UI from disk file (updated by cli serve or _generate_ui)."""
+    index_path = UI_DIR / "index.html"
+    content = index_path.read_text() if index_path.exists() else _get_ui_html()
     headers = {
         "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
         "Pragma": "no-cache",
         "Expires": "0",
     }
-    return HTMLResponse(content=_get_ui_html(), headers=headers)
+    return HTMLResponse(content=content, headers=headers)
 
 
 @app.get("/api/health")
@@ -890,7 +892,11 @@ let isProcessing = false;
 
 function connect() {
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const url = protocol + '//' + location.host + '/ws/chat';
+  // Force IPv4 — localhost can resolve to ::1 which isn't bound
+  const host = location.hostname === 'localhost' || location.hostname === '::1'
+    ? '127.0.0.1:' + location.port
+    : location.host;
+  const url = protocol + '//' + host + '/ws/chat';
   statusText.textContent = 'connecting to ' + url + '...';
   ws = new WebSocket(url);
 

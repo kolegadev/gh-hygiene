@@ -395,7 +395,13 @@ let isProcessing = false;
 
 function connect() {
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(protocol + '//' + location.host + '/ws/chat');
+  // Force IPv4 — localhost can resolve to ::1 which isn't bound
+  const host = location.hostname === 'localhost' || location.hostname === '::1'
+    ? '127.0.0.1:' + location.port
+    : location.host;
+  const url = protocol + '//' + host + '/ws/chat';
+  statusText.textContent = 'connecting to ' + url + '...';
+  ws = new WebSocket(url);
 
   ws.onopen = () => {
     setStatus(true, 'connected');
@@ -404,20 +410,24 @@ function connect() {
     input.focus();
   };
 
-  ws.onclose = () => {
-    setStatus(false, 'disconnected');
+  ws.onclose = (e) => {
+    setStatus(false, 'disconnected (code ' + e.code + ')');
     input.disabled = true;
     sendBtn.disabled = true;
     setTimeout(connect, 3000);
   };
 
   ws.onmessage = (e) => {
-    const msg = JSON.parse(e.data);
-    handleMessage(msg);
+    try {
+      const msg = JSON.parse(e.data);
+      handleMessage(msg);
+    } catch (err) {
+      setStatus(false, 'parse error: ' + err.message);
+    }
   };
 
-  ws.onerror = () => {
-    setStatus(false, 'error');
+  ws.onerror = (e) => {
+    setStatus(false, 'ws error');
   };
 }
 
@@ -754,7 +764,7 @@ async function saveSettings() {
     if (data.status === 'ok') {
       document.getElementById('saved-msg').style.display = 'block';
       setTimeout(() => {
-        location.reload();
+        window.location.reload(true);
       }, 1200);
     }
   } catch (e) {
