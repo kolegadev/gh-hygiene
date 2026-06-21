@@ -69,7 +69,7 @@ class ChatSession:
             api_key: DeepSeek API key
             client: GitHubClient instance
         """
-        self._llm = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+        self._llm = OpenAI(api_key=api_key, base_url="https://api.deepseek.com", timeout=60.0)
         self._gh_client = client
         self._messages: list[dict] = [
             {"role": "system", "content": SYSTEM_PROMPT},

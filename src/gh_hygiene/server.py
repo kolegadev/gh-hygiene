@@ -215,9 +215,9 @@ class WebSocketChatSession:
         except Exception as e:
             await self._send({"type": "error", "content": f"Failed to fetch repos: {e}"})
 
-    async def _run_llm_loop(self, max_iterations: int = 10):
+    async def _run_llm_loop(self, max_iterations: int = 15):
         """Core LLM loop adapted for WebSocket, with cancellation support."""
-        for _ in range(max_iterations):
+        for i in range(max_iterations):
             if self._cancel_event.is_set():
                 self.session._messages.append({
                     "role": "system",
@@ -230,7 +230,14 @@ class WebSocketChatSession:
                 await self._send({"type": "cancelled", "content": "Task interrupted."})
                 return
 
-            response = await asyncio.to_thread(self.session._call_llm)
+            try:
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(self.session._call_llm),
+                    timeout=90.0
+                )
+            except asyncio.TimeoutError:
+                await self._send({"type": "error", "content": "DeepSeek API timed out after 90s. The query may be too complex — try breaking it into smaller steps."})
+                return
 
             if response is None:
                 await self._send({"type": "error", "content": "Failed to get response from DeepSeek. Check your API key."})
@@ -328,7 +335,17 @@ class WebSocketChatSession:
 
             return
 
-        await self._send({"type": "error", "content": "Reached maximum steps. Please continue."})
+        # Max iterations reached — ask LLM to summarize and wrap up
+        self.session._messages.append({
+            "role": "system",
+            "content": "You've reached the maximum number of tool-calling steps for this request. Do NOT call any more tools. Summarize what you've accomplished so far, what's pending, and suggest the user ask a follow-up question to continue."
+        })
+        response = await asyncio.to_thread(self.session._call_llm)
+        if response and response.choices[0].message.content:
+            self.session._messages.append({"role": "assistant", "content": response.choices[0].message.content})
+            await self._send({"type": "text", "content": response.choices[0].message.content})
+        else:
+            await self._send({"type": "error", "content": "Reached maximum steps. Please continue with a follow-up question."})
 
     async def _handle_confirm(self):
         """User confirmed pending destructive actions."""
