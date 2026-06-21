@@ -215,7 +215,7 @@ class WebSocketChatSession:
         except Exception as e:
             await self._send({"type": "error", "content": f"Failed to fetch repos: {e}"})
 
-    async def _run_llm_loop(self, max_iterations: int = 15):
+    async def _run_llm_loop(self, max_iterations: int = 50):
         """Core LLM loop adapted for WebSocket, with cancellation support."""
         for i in range(max_iterations):
             if self._cancel_event.is_set():
