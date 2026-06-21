@@ -299,9 +299,18 @@ class WebSocketChatSession:
                         await self._send({"type": "cancelled", "content": "Task interrupted."})
                         return
 
-                    result = self.session._handle_tool_call(
-                        tc.id, tc.function.name, tc.function.arguments
-                    )
+                    await self._send({"type": "thinking", "content": f"Running {tc.function.name}..."})
+                    try:
+                        result = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                self.session._handle_tool_call,
+                                tc.id, tc.function.name, tc.function.arguments
+                            ),
+                            timeout=120.0
+                        )
+                    except asyncio.TimeoutError:
+                        await self._send({"type": "error", "content": f"Tool {tc.function.name} timed out after 120s."})
+                        result = {"error": f"Tool timed out after 120s"}
 
                     # Check if this is a destructive tool waiting for confirmation
                     if self.session._pending_destructive:
